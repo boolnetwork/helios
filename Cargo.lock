@@ -731,6 +731,7 @@ dependencies = [
  "jsonrpsee",
  "parking_lot",
  "serde",
+ "serde_json",
  "ssz_rs",
  "thiserror",
  "tokio",

@@ -4,6 +4,7 @@ use ethers::{
     types::{Address, Filter, Log, SyncingStatus, Transaction, TransactionReceipt, H256, U256},
 };
 use eyre::Result;
+use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr};
 use std::{fmt::Display, net::SocketAddr, str::FromStr, sync::Arc};
 use tracing::info;
@@ -21,6 +22,8 @@ use common::{
     utils::{hex_str_to_bytes, u64_to_hex_string},
 };
 use execution::types::CallOpts;
+
+use serde_json;
 
 pub struct Rpc<DB: Database> {
     node: Arc<Node<DB>>,
@@ -157,72 +160,72 @@ trait EthSGXRpc {
     #[method(name = "getBalance")]
     async fn get_balance(&self, address: &str, block: BlockTag) -> Result<SGXResult, Error>;
     #[method(name = "getTransactionCount")]
-    async fn get_transaction_count(&self, address: &str, block: BlockTag) -> Result<String, Error>;
+    async fn get_transaction_count(&self, address: &str, block: BlockTag) -> Result<SGXResult, Error>;
     #[method(name = "getBlockTransactionCountByHash")]
-    async fn get_block_transaction_count_by_hash(&self, hash: H256) -> Result<String, Error>;
+    async fn get_block_transaction_count_by_hash(&self, hash: H256) -> Result<SGXResult, Error>;
     #[method(name = "getBlockTransactionCountByNumber")]
     async fn get_block_transaction_count_by_number(&self, block: BlockTag)
-        -> Result<String, Error>;
+        -> Result<SGXResult, Error>;
     #[method(name = "getCode")]
-    async fn get_code(&self, address: &str, block: BlockTag) -> Result<String, Error>;
+    async fn get_code(&self, address: &str, block: BlockTag) -> Result<SGXResult, Error>;
     #[method(name = "call")]
-    async fn call(&self, opts: CallOpts, block: BlockTag) -> Result<String, Error>;
+    async fn call(&self, opts: CallOpts, block: BlockTag) -> Result<SGXResult, Error>;
     #[method(name = "estimateGas")]
-    async fn estimate_gas(&self, opts: CallOpts) -> Result<String, Error>;
+    async fn estimate_gas(&self, opts: CallOpts) -> Result<SGXResult, Error>;
     #[method(name = "chainId")]
     async fn chain_id(&self) -> Result<SGXResult, Error>;
     #[method(name = "gasPrice")]
-    async fn gas_price(&self) -> Result<String, Error>;
+    async fn gas_price(&self) -> Result<SGXResult, Error>;
     #[method(name = "maxPriorityFeePerGas")]
-    async fn max_priority_fee_per_gas(&self) -> Result<String, Error>;
+    async fn max_priority_fee_per_gas(&self) -> Result<SGXResult, Error>;
     #[method(name = "blockNumber")]
-    async fn block_number(&self) -> Result<String, Error>;
+    async fn block_number(&self) -> Result<SGXResult, Error>;
     #[method(name = "getBlockByNumber")]
     async fn get_block_by_number(
         &self,
         block: BlockTag,
         full_tx: bool,
-    ) -> Result<Option<Block>, Error>;
+    ) -> Result<SGXResult, Error>;
     #[method(name = "getBlockByHash")]
-    async fn get_block_by_hash(&self, hash: H256, full_tx: bool) -> Result<Option<Block>, Error>;
+    async fn get_block_by_hash(&self, hash: H256, full_tx: bool) -> Result<SGXResult, Error>;
     #[method(name = "sendRawTransaction")]
-    async fn send_raw_transaction(&self, bytes: &str) -> Result<String, Error>;
+    async fn send_raw_transaction(&self, bytes: &str) -> Result<SGXResult, Error>;
     #[method(name = "getTransactionReceipt")]
     async fn get_transaction_receipt(
         &self,
         hash: H256,
-    ) -> Result<Option<TransactionReceipt>, Error>;
+    ) -> Result<SGXResult, Error>;
     #[method(name = "getTransactionByHash")]
-    async fn get_transaction_by_hash(&self, hash: H256) -> Result<Option<Transaction>, Error>;
+    async fn get_transaction_by_hash(&self, hash: H256) -> Result<SGXResult, Error>;
     #[method(name = "getTransactionByBlockHashAndIndex")]
     async fn get_transaction_by_block_hash_and_index(
         &self,
         hash: H256,
         index: u64,
-    ) -> Result<Option<Transaction>, Error>;
+    ) -> Result<SGXResult, Error>;
     #[method(name = "getLogs")]
-    async fn get_logs(&self, filter: Filter) -> Result<Vec<Log>, Error>;
+    async fn get_logs(&self, filter: Filter) -> Result<SGXResult, Error>;
     #[method(name = "getFilterChanges")]
-    async fn get_filter_changes(&self, filter_id: U256) -> Result<Vec<Log>, Error>;
+    async fn get_filter_changes(&self, filter_id: U256) -> Result<SGXResult, Error>;
     #[method(name = "uninstallFilter")]
-    async fn uninstall_filter(&self, filter_id: U256) -> Result<bool, Error>;
+    async fn uninstall_filter(&self, filter_id: U256) -> Result<SGXResult, Error>;
     #[method(name = "getNewFilter")]
-    async fn get_new_filter(&self, filter: Filter) -> Result<U256, Error>;
+    async fn get_new_filter(&self, filter: Filter) -> Result<SGXResult, Error>;
     #[method(name = "getNewBlockFilter")]
-    async fn get_new_block_filter(&self) -> Result<U256, Error>;
+    async fn get_new_block_filter(&self) -> Result<SGXResult, Error>;
     #[method(name = "getNewPendingTransactionFilter")]
-    async fn get_new_pending_transaction_filter(&self) -> Result<U256, Error>;
+    async fn get_new_pending_transaction_filter(&self) -> Result<SGXResult, Error>;
     #[method(name = "getStorageAt")]
     async fn get_storage_at(
         &self,
         address: &str,
         slot: H256,
         block: BlockTag,
-    ) -> Result<String, Error>;
+    ) -> Result<SGXResult, Error>;
     #[method(name = "coinbase")]
-    async fn coinbase(&self) -> Result<Address, Error>;
+    async fn coinbase(&self) -> Result<SGXResult, Error>;
     #[method(name = "syncing")]
-    async fn syncing(&self) -> Result<SyncingStatus, Error>;
+    async fn syncing(&self) -> Result<SGXResult, Error>;
 }
 
 #[derive(Clone)]
@@ -411,53 +414,53 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
         Ok(sgx_result(format_hex(&balance), self.sgx_sign_fn.clone()))
     }
 
-    async fn get_transaction_count(&self, address: &str, block: BlockTag) -> Result<String, Error> {
+    async fn get_transaction_count(&self, address: &str, block: BlockTag) -> Result<SGXResult, Error> {
         let address = convert_err(Address::from_str(address))?;
         let nonce = convert_err(self.node.get_nonce(&address, block).await)?;
 
-        Ok(format!("0x{nonce:x}"))
+        Ok(sgx_result(format!("0x{nonce:x}"), self.sgx_sign_fn.clone()))
     }
 
-    async fn get_block_transaction_count_by_hash(&self, hash: H256) -> Result<String, Error> {
+    async fn get_block_transaction_count_by_hash(&self, hash: H256) -> Result<SGXResult, Error> {
         let transaction_count =
-            convert_err(self.node.get_block_transaction_count_by_hash(&hash).await)?;
-        Ok(u64_to_hex_string(transaction_count))
+            convert_err(self.node.get_block_transaction_count_by_hash(&hash).await)?; 
+        Ok(sgx_result(u64_to_hex_string(transaction_count), self.sgx_sign_fn.clone()))
     }
 
     async fn get_block_transaction_count_by_number(
         &self,
         block: BlockTag,
-    ) -> Result<String, Error> {
+    ) -> Result<SGXResult, Error> {
         let transaction_count =
             convert_err(self.node.get_block_transaction_count_by_number(block).await)?;
-        Ok(u64_to_hex_string(transaction_count))
+        Ok(sgx_result(u64_to_hex_string(transaction_count), self.sgx_sign_fn.clone()))
     }
 
-    async fn get_code(&self, address: &str, block: BlockTag) -> Result<String, Error> {
+    async fn get_code(&self, address: &str, block: BlockTag) -> Result<SGXResult, Error> {
         let address = convert_err(Address::from_str(address))?;
         let code = convert_err(self.node.get_code(&address, block).await)?;
 
-        Ok(format!("0x{:}", hex::encode(code)))
+        Ok(sgx_result(format!("0x{:}", hex::encode(code)), self.sgx_sign_fn.clone()))
     }
 
-    async fn call(&self, opts: CallOpts, block: BlockTag) -> Result<String, Error> {
+    async fn call(&self, opts: CallOpts, block: BlockTag) -> Result<SGXResult, Error> {
         let res = self
             .node
             .call(&opts, block)
             .await
             .map_err(NodeError::to_json_rpsee_error)?;
 
-        Ok(format!("0x{}", hex::encode(res)))
+        Ok(sgx_result(format!("0x{:}", hex::encode(res)), self.sgx_sign_fn.clone()))
     }
 
-    async fn estimate_gas(&self, opts: CallOpts) -> Result<String, Error> {
+    async fn estimate_gas(&self, opts: CallOpts) -> Result<SGXResult, Error> {
         let gas = self
             .node
             .estimate_gas(&opts)
             .await
             .map_err(NodeError::to_json_rpsee_error)?;
 
-        Ok(u64_to_hex_string(gas))
+        Ok(sgx_result(u64_to_hex_string(gas), self.sgx_sign_fn.clone()))
     }
 
     async fn chain_id(&self) -> Result<SGXResult, Error> {
@@ -465,94 +468,101 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
         Ok(sgx_result(u64_to_hex_string(id), self.sgx_sign_fn.clone()))
     }
 
-    async fn gas_price(&self) -> Result<String, Error> {
+    async fn gas_price(&self) -> Result<SGXResult, Error> {
         let gas_price = convert_err(self.node.get_gas_price().await)?;
-        Ok(format_hex(&gas_price))
+        Ok(sgx_result(format_hex(&gas_price), self.sgx_sign_fn.clone()))
     }
 
-    async fn max_priority_fee_per_gas(&self) -> Result<String, Error> {
+    async fn max_priority_fee_per_gas(&self) -> Result<SGXResult, Error> {
         let tip = convert_err(self.node.get_priority_fee())?;
-        Ok(format_hex(&tip))
+        Ok(sgx_result(format_hex(&tip), self.sgx_sign_fn.clone()))
     }
 
-    async fn block_number(&self) -> Result<String, Error> {
+    async fn block_number(&self) -> Result<SGXResult, Error> {
         let num = convert_err(self.node.get_block_number().await)?;
-        Ok(u64_to_hex_string(num.as_u64()))
+        Ok(sgx_result(u64_to_hex_string(num.as_u64()), self.sgx_sign_fn.clone()))
     }
 
     async fn get_block_by_number(
         &self,
         block: BlockTag,
         full_tx: bool,
-    ) -> Result<Option<Block>, Error> {
+    ) -> Result<SGXResult, Error> {
         let block = convert_err(self.node.get_block_by_number(block, full_tx).await)?;
-        Ok(block)
+        let block = serde_json::to_string(&block).unwrap();
+        Ok(sgx_result(block, self.sgx_sign_fn.clone()))
     }
 
-    async fn get_block_by_hash(&self, hash: H256, full_tx: bool) -> Result<Option<Block>, Error> {
+    async fn get_block_by_hash(&self, hash: H256, full_tx: bool) -> Result<SGXResult, Error> {
         let block = convert_err(self.node.get_block_by_hash(&hash, full_tx).await)?;
-        Ok(block)
+        let block = serde_json::to_string(&block).unwrap();
+        Ok(sgx_result(block, self.sgx_sign_fn.clone()))
     }
 
-    async fn send_raw_transaction(&self, bytes: &str) -> Result<String, Error> {
+    async fn send_raw_transaction(&self, bytes: &str) -> Result<SGXResult, Error> {
         let bytes = convert_err(hex_str_to_bytes(bytes))?;
         let tx_hash = convert_err(self.node.send_raw_transaction(&bytes).await)?;
-        Ok(hex::encode(tx_hash))
+        Ok(sgx_result(hex::encode(tx_hash), self.sgx_sign_fn.clone()))
     }
 
     async fn get_transaction_receipt(
         &self,
         hash: H256,
-    ) -> Result<Option<TransactionReceipt>, Error> {
+    ) -> Result<SGXResult, Error> {
         let receipt = convert_err(self.node.get_transaction_receipt(&hash).await)?;
-        Ok(receipt)
+        let receipt = serde_json::to_string(&receipt).unwrap();
+        Ok(sgx_result(receipt, self.sgx_sign_fn.clone()))
     }
 
-    async fn get_transaction_by_hash(&self, hash: H256) -> Result<Option<Transaction>, Error> {
-        Ok(self.node.get_transaction_by_hash(&hash).await)
+    async fn get_transaction_by_hash(&self, hash: H256) -> Result<SGXResult, Error> {
+        let res = serde_json::to_string(&self.node.get_transaction_by_hash(&hash).await).unwrap();
+
+        Ok(sgx_result(res, self.sgx_sign_fn.clone()))
     }
 
     async fn get_transaction_by_block_hash_and_index(
         &self,
         hash: H256,
         index: u64,
-    ) -> Result<Option<Transaction>, Error> {
-        Ok(self
+    ) -> Result<SGXResult, Error> {
+        let res = self
             .node
             .get_transaction_by_block_hash_and_index(&hash, index)
-            .await)
+            .await;
+        let res = serde_json::to_string(&res).unwrap();
+        Ok(sgx_result(res, self.sgx_sign_fn.clone()))
     }
 
-    async fn coinbase(&self) -> Result<Address, Error> {
-        convert_err(self.node.get_coinbase().await)
+    async fn coinbase(&self) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.get_coinbase().await, self.sgx_sign_fn.clone())
     }
 
-    async fn syncing(&self) -> Result<SyncingStatus, Error> {
-        convert_err(self.node.syncing().await)
+    async fn syncing(&self) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.syncing().await, self.sgx_sign_fn.clone())
     }
 
-    async fn get_logs(&self, filter: Filter) -> Result<Vec<Log>, Error> {
-        convert_err(self.node.get_logs(&filter).await)
+    async fn get_logs(&self, filter: Filter) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.get_logs(&filter).await, self.sgx_sign_fn.clone())
     }
 
-    async fn get_filter_changes(&self, filter_id: U256) -> Result<Vec<Log>, Error> {
-        convert_err(self.node.get_filter_changes(&filter_id).await)
+    async fn get_filter_changes(&self, filter_id: U256) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.get_filter_changes(&filter_id).await, self.sgx_sign_fn.clone())
     }
 
-    async fn uninstall_filter(&self, filter_id: U256) -> Result<bool, Error> {
-        convert_err(self.node.uninstall_filter(&filter_id).await)
+    async fn uninstall_filter(&self, filter_id: U256) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.uninstall_filter(&filter_id).await, self.sgx_sign_fn.clone())
     }
 
-    async fn get_new_filter(&self, filter: Filter) -> Result<U256, Error> {
-        convert_err(self.node.get_new_filter(&filter).await)
+    async fn get_new_filter(&self, filter: Filter) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.get_new_filter(&filter).await, self.sgx_sign_fn.clone())
     }
 
-    async fn get_new_block_filter(&self) -> Result<U256, Error> {
-        convert_err(self.node.get_new_block_filter().await)
+    async fn get_new_block_filter(&self) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.get_new_block_filter().await, self.sgx_sign_fn.clone())
     }
 
-    async fn get_new_pending_transaction_filter(&self) -> Result<U256, Error> {
-        convert_err(self.node.get_new_pending_transaction_filter().await)
+    async fn get_new_pending_transaction_filter(&self) -> Result<SGXResult, Error> {
+        convert_err_sgx(self.node.get_new_pending_transaction_filter().await, self.sgx_sign_fn.clone())
     }
 
     async fn get_storage_at(
@@ -560,11 +570,11 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
         address: &str,
         slot: H256,
         block: BlockTag,
-    ) -> Result<String, Error> {
+    ) -> Result<SGXResult, Error> {
         let address = convert_err(Address::from_str(address))?;
         let storage = convert_err(self.node.get_storage_at(&address, slot, block).await)?;
 
-        Ok(format_hex(&storage))
+        Ok(sgx_result(format_hex(&storage), self.sgx_sign_fn.clone()))
     }
 }
 
@@ -595,6 +605,16 @@ async fn start<DB: Database>(rpc: RpcInner<DB>) -> Result<(ServerHandle, SocketA
 
 fn convert_err<T, E: Display>(res: Result<T, E>) -> Result<T, Error> {
     res.map_err(|err| Error::Custom(err.to_string()))
+}
+
+fn convert_err_sgx<T: Serialize, E: Display>(res: Result<T, E>, sign_fn: Option<Arc<Box<dyn Fn(String) -> String>>> ) -> Result<SGXResult, Error> {
+    match res {
+        Ok(res) => {    
+            let res = serde_json::to_string(&res).unwrap();
+            Ok(sgx_result(res, sign_fn.clone()))
+        },
+        Err(err) =>  Err(Error::Custom(err.to_string()))
+    }
 }
 
 fn format_hex(num: &U256) -> String {
