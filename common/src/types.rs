@@ -123,3 +123,11 @@ impl<'de> Deserialize<'de> for BlockTag {
         Ok(block_tag)
     }
 }
+
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SGXResult{
+    pub result: String,
+    pub sig: String,
+}

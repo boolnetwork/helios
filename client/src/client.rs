@@ -260,6 +260,15 @@ impl<DB: Database> Client<DB> {
         Ok(())
     }
 
+    pub async fn start_sgx(&mut self, sgx_fn: Arc<Box<dyn Fn(String) -> String>>) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(rpc) = &mut self.rpc {
+            rpc.start_sgx(sgx_fn).await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn shutdown(&self) {
         info!(target: "helios::client","shutting down");
         if let Err(err) = self.node.consensus.shutdown() {
