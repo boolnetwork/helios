@@ -48,7 +48,8 @@ impl<DB: Database> Rpc<DB> {
         let rpc_inner = RpcInner {
             node: self.node.clone(),
             address: self.address,
-            sgx_sign_fn: None
+            sgx_sign_fn: None,
+            publickey: None
         };
 
         let (handle, addr) = start(rpc_inner).await?;
@@ -59,11 +60,12 @@ impl<DB: Database> Rpc<DB> {
         Ok(addr)
     }
 
-    pub async fn start_sgx(&mut self, sgx_fn: Arc<Box<dyn Fn(String) -> String>> ) -> Result<SocketAddr> {
+    pub async fn start_sgx(&mut self, sgx_fn: Arc<Box<dyn Fn(String) -> String>>, publickey: String) -> Result<SocketAddr> {
         let rpc_inner = RpcInner {
             node: self.node.clone(),
             address: self.address,
-            sgx_sign_fn: Some(sgx_fn)
+            sgx_sign_fn: Some(sgx_fn),
+            publickey: Some(publickey) 
         };
 
         let (handle, addr) = start(rpc_inner).await?;
@@ -228,11 +230,26 @@ trait EthSGXRpc {
     async fn syncing(&self) -> Result<SGXResult, Error>;
 }
 
+#[rpc(server, namespace = "sgx")]
+trait SGXRpc {
+    #[method(name = "getPubkey")]
+    async fn get_pubkey(&self) -> Result<String, Error>;
+}
+
+#[async_trait]
+impl<DB: Database> SGXRpcServer for RpcInner<DB> {
+    async fn get_pubkey(&self) -> Result<String, Error>{
+        let pubkey = self.publickey.clone().unwrap();
+        Ok(pubkey)
+    }
+}
+
 #[derive(Clone)]
 struct RpcInner<DB: Database> {
     node: Arc<Node<DB>>,
     address: SocketAddr,
-    sgx_sign_fn: Option<Arc<Box<dyn Fn(String) -> String>>>, 
+    sgx_sign_fn: Option<Arc<Box<dyn Fn(String) -> String>>>,
+    publickey: Option<String> 
 }
 
 unsafe impl<DB: Database> Send for RpcInner<DB> {}
@@ -592,11 +609,13 @@ async fn start<DB: Database>(rpc: RpcInner<DB>) -> Result<(ServerHandle, SocketA
     let mut methods = Methods::new();
     let eth_methods: Methods = EthRpcServer::into_rpc(rpc.clone()).into();
     let net_methods: Methods = NetRpcServer::into_rpc(rpc.clone()).into();
-    let eth_sgx_methods: Methods = EthSGXRpcServer::into_rpc(rpc).into();
+    let eth_sgx_methods: Methods = EthSGXRpcServer::into_rpc(rpc.clone()).into();
+    let sgx_methods: Methods = SGXRpcServer::into_rpc(rpc).into();
 
     methods.merge(eth_methods)?;
     methods.merge(net_methods)?;
     methods.merge(eth_sgx_methods)?;
+    methods.merge(sgx_methods)?;
 
     let handle = server.start(methods)?;
 
