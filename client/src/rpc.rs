@@ -428,20 +428,20 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
         let address = convert_err(Address::from_str(address))?;
         let balance = convert_err(self.node.get_balance(&address, block).await)?;
 
-        Ok(sgx_result(format_hex(&balance), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(format_hex(&balance), self.sgx_sign_fn.clone()))
     }
 
     async fn get_transaction_count(&self, address: &str, block: BlockTag) -> Result<SGXResult, Error> {
         let address = convert_err(Address::from_str(address))?;
         let nonce = convert_err(self.node.get_nonce(&address, block).await)?;
 
-        Ok(sgx_result(format!("0x{nonce:x}"), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(format!("0x{nonce:x}"), self.sgx_sign_fn.clone()))
     }
 
     async fn get_block_transaction_count_by_hash(&self, hash: H256) -> Result<SGXResult, Error> {
         let transaction_count =
             convert_err(self.node.get_block_transaction_count_by_hash(&hash).await)?; 
-        Ok(sgx_result(u64_to_hex_string(transaction_count), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(u64_to_hex_string(transaction_count), self.sgx_sign_fn.clone()))
     }
 
     async fn get_block_transaction_count_by_number(
@@ -450,14 +450,14 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
     ) -> Result<SGXResult, Error> {
         let transaction_count =
             convert_err(self.node.get_block_transaction_count_by_number(block).await)?;
-        Ok(sgx_result(u64_to_hex_string(transaction_count), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(u64_to_hex_string(transaction_count), self.sgx_sign_fn.clone()))
     }
 
     async fn get_code(&self, address: &str, block: BlockTag) -> Result<SGXResult, Error> {
         let address = convert_err(Address::from_str(address))?;
         let code = convert_err(self.node.get_code(&address, block).await)?;
 
-        Ok(sgx_result(format!("0x{:}", hex::encode(code)), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(format!("0x{:}", hex::encode(code)), self.sgx_sign_fn.clone()))
     }
 
     async fn call(&self, opts: CallOpts, block: BlockTag) -> Result<SGXResult, Error> {
@@ -467,7 +467,7 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
             .await
             .map_err(NodeError::to_json_rpsee_error)?;
 
-        Ok(sgx_result(format!("0x{:}", hex::encode(res)), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(format!("0x{:}", hex::encode(res)), self.sgx_sign_fn.clone()))
     }
 
     async fn estimate_gas(&self, opts: CallOpts) -> Result<SGXResult, Error> {
@@ -477,27 +477,27 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
             .await
             .map_err(NodeError::to_json_rpsee_error)?;
 
-        Ok(sgx_result(u64_to_hex_string(gas), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(u64_to_hex_string(gas), self.sgx_sign_fn.clone()))
     }
 
     async fn chain_id(&self) -> Result<SGXResult, Error> {
         let id = self.node.chain_id();
-        Ok(sgx_result(u64_to_hex_string(id), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(u64_to_hex_string(id), self.sgx_sign_fn.clone()))
     }
 
     async fn gas_price(&self) -> Result<SGXResult, Error> {
         let gas_price = convert_err(self.node.get_gas_price().await)?;
-        Ok(sgx_result(format_hex(&gas_price), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(format_hex(&gas_price), self.sgx_sign_fn.clone()))
     }
 
     async fn max_priority_fee_per_gas(&self) -> Result<SGXResult, Error> {
         let tip = convert_err(self.node.get_priority_fee())?;
-        Ok(sgx_result(format_hex(&tip), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(format_hex(&tip), self.sgx_sign_fn.clone()))
     }
 
     async fn block_number(&self) -> Result<SGXResult, Error> {
         let num = convert_err(self.node.get_block_number().await)?;
-        Ok(sgx_result(u64_to_hex_string(num.as_u64()), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(u64_to_hex_string(num.as_u64()), self.sgx_sign_fn.clone()))
     }
 
     async fn get_block_by_number(
@@ -519,7 +519,7 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
     async fn send_raw_transaction(&self, bytes: &str) -> Result<SGXResult, Error> {
         let bytes = convert_err(hex_str_to_bytes(bytes))?;
         let tx_hash = convert_err(self.node.send_raw_transaction(&bytes).await)?;
-        Ok(sgx_result(hex::encode(tx_hash), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(hex::encode(tx_hash), self.sgx_sign_fn.clone()))
     }
 
     async fn get_transaction_receipt(
@@ -591,7 +591,7 @@ impl<DB: Database> EthSGXRpcServer for RpcInner<DB> {
         let address = convert_err(Address::from_str(address))?;
         let storage = convert_err(self.node.get_storage_at(&address, slot, block).await)?;
 
-        Ok(sgx_result(format_hex(&storage), self.sgx_sign_fn.clone()))
+        Ok(sgx_result_json(format_hex(&storage), self.sgx_sign_fn.clone()))
     }
 }
 
@@ -657,5 +657,13 @@ fn sgx_result(result: String, sign_fn: Option<Arc<Box<dyn Fn(String) -> String>>
     SGXResult{
         result: result.clone(),
         sig: sign_fn.unwrap()(result) 
+    }
+}
+
+fn sgx_result_json(result: String, sign_fn: Option<Arc<Box<dyn Fn(String) -> String>>> ) -> SGXResult{
+    let res = serde_json::to_string(&result).unwrap();
+    SGXResult{
+        result: result.clone(),
+        sig: sign_fn.unwrap()(res) 
     }
 }
