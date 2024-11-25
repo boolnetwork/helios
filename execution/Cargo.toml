@@ -26,6 +26,8 @@ tracing.workspace = true
 thiserror.workspace = true
 #hyper.workspace = true
 
+lazy_static.workspace = true
+
 consensus = { path = "../consensus" }
 common = { path = "../common" }
 

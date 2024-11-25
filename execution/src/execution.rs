@@ -4,7 +4,7 @@ use alloy::consensus::{Receipt, ReceiptWithBloom, TxReceipt, TxType};
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::rlp::encode;
 use alloy::rpc::types::{Filter, Log, Transaction, TransactionReceipt};
-use eyre::Result;
+use eyre::{Ok, Result};
 use futures::future::join_all;
 use revm::primitives::KECCAK_EMPTY;
 use triehash_ethereum::ordered_trie_root;
@@ -19,6 +19,16 @@ use crate::state::State;
 use super::proof::{encode_account, verify_proof};
 use super::rpc::ExecutionRpc;
 use super::types::Account;
+
+use std::collections::BTreeMap;
+use tokio::sync::RwLock;
+use std::sync::Arc;
+
+lazy_static::lazy_static! {
+    pub static ref RECEIPTS_CACHE: Arc<RwLock<BTreeMap<Vec<u8>,
+                                       Arc<RwLock<Option<Vec<TransactionReceipt>>>>>>> =
+        Arc::new(RwLock::new(BTreeMap::new()));
+}
 
 #[derive(Clone)]
 pub struct ExecutionClient<R: ExecutionRpc> {
@@ -158,6 +168,77 @@ impl<R: ExecutionRpc> ExecutionClient<R> {
         self.state
             .get_transaction_by_block_and_index(block_hash, index)
             .await
+    }
+
+    pub async fn get_transaction_receipt_with_cached_data(
+        &self,
+        tx_hash: B256,
+    ) -> std::result::Result<Option<TransactionReceipt>, String> {
+        let key = tx_hash.to_vec();
+        let mut receipts_cache = RECEIPTS_CACHE.write().await;
+
+        let result_lock = if receipts_cache.contains_key(&key) {
+            receipts_cache.get(&key).clone().unwrap().clone()
+       } else {
+            let new_result_lock = Arc::new(RwLock::new(None));
+            receipts_cache.insert(key, new_result_lock.clone());
+            if receipts_cache.len() >= 5000 {
+                if let Some(first_key) = receipts_cache.keys().next().cloned() {
+                    receipts_cache.remove(&first_key);
+                }
+            }
+            new_result_lock.clone()
+        };
+        let mut cache = result_lock.write().await;
+        drop(receipts_cache);
+
+        if let Some(receipts) = cache.clone() {
+            match receipts.iter().find(|tr| tr.transaction_hash == tx_hash ).cloned() {
+                Some(receipt) => return std::result::Result::Ok(Some(receipt)),
+                None => return Err(ExecutionError::ReceiptRootMismatch(tx_hash).to_string()),
+            }  
+        }
+
+        let receipt = self.rpc.get_transaction_receipt(tx_hash).await
+        .map_err(|e| e.to_string())?;
+        if receipt.is_none() {
+            return std::result::Result::Ok(None);
+        }
+
+        let receipt = receipt.unwrap();
+        let block_number = receipt.block_number.unwrap();
+
+        let block = self.state.get_block(BlockTag::Number(block_number)).await;
+        let block = if let Some(block) = block {
+            block
+        } else {
+            return std::result::Result::Ok(None);
+        };
+
+        let tx_hashes = block.transactions.hashes();
+
+        let receipts_fut = tx_hashes.iter().map(|hash| async move {
+            let receipt = self.rpc.get_transaction_receipt(*hash).await;
+            receipt.map_err(|e| e.to_string())?.ok_or(format!("not reachable"))
+        });
+
+        let receipts = join_all(receipts_fut).await;
+        let receipts = receipts.into_iter().map(|res|
+        res.map_err(|err| err.to_string())).collect::<std::result::Result<Vec<_>,String>>()?;
+        let receipts_encoded: Vec<Vec<u8>> = receipts.iter().map(encode_receipt).collect();
+
+        let expected_receipt_root = ordered_trie_root(receipts_encoded);
+        let expected_receipt_root = B256::from_slice(&expected_receipt_root.to_fixed_bytes());
+
+        if expected_receipt_root == block.receipts_root{
+            *cache = Some(receipts.clone());
+        }
+
+        if expected_receipt_root != block.receipts_root || !receipts.contains(&receipt) {
+            return Err(ExecutionError::ReceiptRootMismatch(tx_hash).to_string());
+        }
+
+        std::result::Result::Ok(Some(receipt))
     }
 
     pub async fn get_transaction_receipt(

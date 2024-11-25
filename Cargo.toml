@@ -75,6 +75,7 @@ openssl = { version = "0.10", features = ["vendored"] }
 zduny-wasm-timer = "0.2.8"
 retri = "0.1.0"
 typenum = "1.17.0"
+lazy_static = "1.5"
 
 ######################################
 # Top Level Dependencies
