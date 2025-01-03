@@ -114,6 +114,14 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Node<N, C> {
         self.execution.send_raw_transaction(bytes).await
     }
 
+    pub async fn get_transaction_receipt_with_cached_data(
+        &self,
+        tx_hash: B256,
+    ) -> Result<Option<N::ReceiptResponse>> {
+        self.execution.get_transaction_receipt_with_cached_data(tx_hash).await
+        .map_err(|e| eyre::Error::msg(e))
+    }
+
     pub async fn get_transaction_receipt(
         &self,
         tx_hash: B256,

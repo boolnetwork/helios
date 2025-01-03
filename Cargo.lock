@@ -3091,6 +3091,7 @@ dependencies = [
  "gloo-timers 0.3.0",
  "hex",
  "jsonrpsee",
+ "lazy_static",
  "openssl",
  "parking_lot 0.12.3",
  "reqwest",
