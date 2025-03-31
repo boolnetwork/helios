@@ -3,69 +3,98 @@ use std::{
     sync::Arc,
 };
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::{
+    consensus::BlockHeader,
+    eips::BlockId,
+    network::{primitives::HeaderResponse, BlockResponse},
+    primitives::{Address, B256, U256},
+    rpc::types::{BlockTransactions, Filter},
+};
 use eyre::{eyre, Result};
 use tokio::{
     select,
-    sync::{mpsc::Receiver, watch, RwLock},
+    sync::{broadcast, mpsc::Receiver, watch, RwLock},
 };
 use tracing::{info, warn};
 
-use crate::network_spec::NetworkSpec;
-use crate::types::{Block, BlockTag, Transactions};
+use helios_common::{
+    network_spec::NetworkSpec,
+    types::{BlockTag, SubEventRx, SubscriptionEvent},
+};
 
-use super::rpc::ExecutionRpc;
+use super::spec::ExecutionSpec;
 
+pub fn start_state_updater<N: NetworkSpec>(
+    state: State<N>,
+    client: Arc<dyn ExecutionSpec<N>>,
+    mut block_recv: Receiver<N::BlockResponse>,
+    mut finalized_block_recv: watch::Receiver<Option<N::BlockResponse>>,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    let run = tokio::spawn;
+    #[cfg(target_arch = "wasm32")]
+    let run = wasm_bindgen_futures::spawn_local;
+
+    run(async move {
+        loop {
+            select! {
+                block = block_recv.recv() => {
+                    if let Some(block) = block {
+                        state.inner.write().await.push_block(block, client.clone()).await;
+                    }
+                },
+                _ = finalized_block_recv.changed() => {
+                    let block = finalized_block_recv.borrow_and_update().clone();
+                    if let Some(block) = block {
+                        state.inner.write().await.push_finalized_block(block);
+                    }
+                },
+            }
+        }
+    });
+}
 #[derive(Clone)]
-pub struct State<N: NetworkSpec, R: ExecutionRpc<N>> {
-    inner: Arc<RwLock<Inner<N, R>>>,
+pub struct State<N: NetworkSpec> {
+    inner: Arc<RwLock<Inner<N>>>,
 }
 
-impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
-    pub fn new(
-        mut block_recv: Receiver<Block<N::TransactionResponse>>,
-        mut finalized_block_recv: watch::Receiver<Option<Block<N::TransactionResponse>>>,
-        history_length: u64,
-        rpc: &str,
-    ) -> Self {
-        let rpc = R::new(rpc).unwrap();
-        let inner = Arc::new(RwLock::new(Inner::new(history_length, rpc)));
-        let inner_ref = inner.clone();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let run = tokio::spawn;
-        #[cfg(target_arch = "wasm32")]
-        let run = wasm_bindgen_futures::spawn_local;
-
-        run(async move {
-            loop {
-                select! {
-                    block = block_recv.recv() => {
-                        if let Some(block) = block {
-                            inner_ref.write().await.push_block(block).await;
-                        }
-                    },
-                    _ = finalized_block_recv.changed() => {
-                        let block = finalized_block_recv.borrow_and_update().clone();
-                        if let Some(block) = block {
-                            inner_ref.write().await.push_finalized_block(block).await;
-                        }
-
-                    },
-                }
-            }
-        });
-
-        Self { inner }
+impl<N: NetworkSpec> State<N> {
+    pub fn new(history_length: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Inner::new(history_length))),
+        }
     }
 
-    pub async fn push_block(&self, block: Block<N::TransactionResponse>) {
-        self.inner.write().await.push_block(block).await;
+    pub async fn push_block(&self, block: N::BlockResponse, client: Arc<dyn ExecutionSpec<N>>) {
+        self.inner.write().await.push_block(block, client).await
     }
 
     // full block fetch
 
-    pub async fn get_block(&self, tag: BlockTag) -> Option<Block<N::TransactionResponse>> {
+    pub async fn get_block_by_id(
+        &self,
+        block_id: BlockId,
+        full_tx: bool,
+    ) -> Result<Option<N::BlockResponse>> {
+        let block = match block_id {
+            BlockId::Number(tag) => self.get_block(tag.try_into()?).await,
+            BlockId::Hash(hash) => self.get_block_by_hash(hash.into()).await,
+        };
+        if block.is_none() {
+            warn!(target: "helios::execution", "requested block not found in state: {}", block_id);
+            return Ok(None);
+        };
+        let mut block = block.unwrap();
+
+        if !full_tx {
+            *block.transactions_mut() =
+                BlockTransactions::Hashes(block.transactions().hashes().collect());
+        }
+
+        Ok(Some(block))
+    }
+
+    pub async fn get_block(&self, tag: BlockTag) -> Option<N::BlockResponse> {
         match tag {
             BlockTag::Latest => self
                 .inner
@@ -80,7 +109,7 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
         }
     }
 
-    pub async fn get_block_by_hash(&self, hash: B256) -> Option<Block<N::TransactionResponse>> {
+    pub async fn get_block_by_hash(&self, hash: B256) -> Option<N::BlockResponse> {
         let inner = self.inner.read().await;
         inner
             .hashes
@@ -89,12 +118,12 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
             .cloned()
     }
 
-    pub async fn get_blocks_after(&self, tag: BlockTag) -> Vec<Block<N::TransactionResponse>> {
+    pub async fn get_blocks_after(&self, tag: BlockTag) -> Vec<N::BlockResponse> {
         let start_block = self.get_block(tag).await;
         if start_block.is_none() {
             return vec![];
         }
-        let start_block_num = start_block.unwrap().number.to::<u64>();
+        let start_block_num = start_block.unwrap().header().number();
         let blocks = self
             .inner
             .read()
@@ -117,9 +146,10 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
                 inner
                     .blocks
                     .get(&loc.block)
-                    .and_then(|block| match &block.transactions {
-                        Transactions::Full(txs) => txs.get(loc.index),
-                        Transactions::Hashes(_) => unreachable!(),
+                    .and_then(|block| match &block.transactions() {
+                        BlockTransactions::Full(txs) => txs.get(loc.index),
+                        BlockTransactions::Hashes(_) => unreachable!(),
+                        BlockTransactions::Uncle => unreachable!(),
                     })
             })
             .cloned()
@@ -135,9 +165,10 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
             .hashes
             .get(&block_hash)
             .and_then(|number| inner.blocks.get(number))
-            .and_then(|block| match &block.transactions {
-                Transactions::Full(txs) => txs.get(index as usize),
-                Transactions::Hashes(_) => unreachable!(),
+            .and_then(|block| match &block.transactions() {
+                BlockTransactions::Full(txs) => txs.get(index as usize),
+                BlockTransactions::Hashes(_) => unreachable!(),
+                BlockTransactions::Uncle => unreachable!(),
             })
             .cloned()
     }
@@ -148,30 +179,37 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
         index: u64,
     ) -> Option<N::TransactionResponse> {
         let block = self.get_block(tag).await?;
-        match &block.transactions {
-            Transactions::Full(txs) => txs.get(index as usize).cloned(),
-            Transactions::Hashes(_) => unreachable!(),
+        match &block.transactions() {
+            BlockTransactions::Full(txs) => txs.get(index as usize).cloned(),
+            BlockTransactions::Hashes(_) => unreachable!(),
+            BlockTransactions::Uncle => unreachable!(),
         }
     }
 
     // block field fetch
 
     pub async fn get_state_root(&self, tag: BlockTag) -> Option<B256> {
-        self.get_block(tag).await.map(|block| block.state_root)
+        self.get_block(tag)
+            .await
+            .map(|block| block.header().state_root())
     }
 
     pub async fn get_receipts_root(&self, tag: BlockTag) -> Option<B256> {
-        self.get_block(tag).await.map(|block| block.receipts_root)
-    }
-
-    pub async fn get_base_fee(&self, tag: BlockTag) -> Option<U256> {
         self.get_block(tag)
             .await
-            .map(|block| block.base_fee_per_gas)
+            .map(|block| block.header().receipts_root())
+    }
+
+    pub async fn get_base_fee(&self, tag: BlockTag) -> Option<Option<u64>> {
+        self.get_block(tag)
+            .await
+            .map(|block| block.header().base_fee_per_gas())
     }
 
     pub async fn get_coinbase(&self, tag: BlockTag) -> Option<Address> {
-        self.get_block(tag).await.map(|block| block.miner)
+        self.get_block(tag)
+            .await
+            .map(|block| block.header().beneficiary())
     }
 
     // filter
@@ -199,38 +237,43 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> State<N, R> {
         let inner = self.inner.read().await;
         inner.blocks.first_key_value().map(|entry| *entry.0)
     }
+
+    pub async fn subscribe_blocks(&self) -> SubEventRx<N> {
+        self.inner.read().await.blocks_broadcast.subscribe()
+    }
 }
 
-struct Inner<N: NetworkSpec, R: ExecutionRpc<N>> {
-    blocks: BTreeMap<u64, Block<N::TransactionResponse>>,
-    finalized_block: Option<Block<N::TransactionResponse>>,
+pub struct Inner<N: NetworkSpec> {
+    blocks: BTreeMap<u64, N::BlockResponse>,
+    blocks_broadcast: broadcast::Sender<SubscriptionEvent<N>>,
+    finalized_block: Option<N::BlockResponse>,
     hashes: HashMap<B256, u64>,
     txs: HashMap<B256, TransactionLocation>,
     filters: HashMap<U256, FilterType>,
-    history_length: u64,
-    rpc: R,
+    history_length: usize,
 }
 
-impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
-    pub fn new(history_length: u64, rpc: R) -> Self {
+impl<N: NetworkSpec> Inner<N> {
+    pub fn new(history_length: usize) -> Self {
+        let (blocks_broadcast, _) = broadcast::channel(100);
         Self {
-            history_length,
             blocks: BTreeMap::default(),
+            blocks_broadcast,
             finalized_block: None,
             hashes: HashMap::default(),
             txs: HashMap::default(),
             filters: HashMap::default(),
-            rpc,
+            history_length,
         }
     }
 
-    pub async fn push_block(&mut self, block: Block<N::TransactionResponse>) {
-        let block_number = block.number.to::<u64>();
-        if self.try_insert_tip(block) {
+    pub async fn push_block(&mut self, block: N::BlockResponse, client: Arc<dyn ExecutionSpec<N>>) {
+        let block_number = block.header().number();
+        if self.try_insert_tip(block.clone()) {
             let mut n = block_number;
 
             loop {
-                if let Ok(backfilled) = self.backfill_behind(n).await {
+                if let Ok(backfilled) = self.backfill_behind(n, client.clone()).await {
                     if !backfilled {
                         break;
                     }
@@ -245,43 +288,47 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
             let link_parent = self.blocks.get(&(n - 1));
 
             if let (Some(parent), Some(child)) = (link_parent, link_child) {
-                if child.parent_hash != parent.hash {
+                if child.header().parent_hash() != parent.header().hash() {
                     warn!("detected block reorganization");
                     self.prune_before(n);
                 }
             }
 
             self.prune();
+
+            let _ = self
+                .blocks_broadcast
+                .send(SubscriptionEvent::NewHeads(block));
         }
     }
 
-    fn try_insert_tip(&mut self, block: Block<N::TransactionResponse>) -> bool {
+    fn try_insert_tip(&mut self, block: N::BlockResponse) -> bool {
         if let Some((num, _)) = self.blocks.last_key_value() {
-            if num > &block.number.to() {
+            if num > &block.header().number() {
                 return false;
             }
         }
 
-        self.hashes.insert(block.hash, block.number.to());
+        self.hashes
+            .insert(block.header().hash(), block.header().number());
         block
-            .transactions
+            .transactions()
             .hashes()
-            .iter()
             .enumerate()
             .for_each(|(i, tx)| {
                 let location = TransactionLocation {
-                    block: block.number.to(),
+                    block: block.header().number(),
                     index: i,
                 };
-                self.txs.insert(*tx, location);
+                self.txs.insert(tx, location);
             });
 
-        self.blocks.insert(block.number.to(), block);
+        self.blocks.insert(block.header().number(), block);
         true
     }
 
     fn prune(&mut self) {
-        while self.blocks.len() as u64 > self.history_length {
+        while self.blocks.len() > self.history_length {
             if let Some((number, _)) = self.blocks.first_key_value() {
                 self.remove_block(*number);
             }
@@ -289,32 +336,34 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
     }
 
     fn prune_before(&mut self, n: u64) {
-        loop {
-            if let Some((oldest, _)) = self.blocks.first_key_value() {
-                let oldest = *oldest;
-                if oldest < n {
-                    self.blocks.remove(&oldest);
-                } else {
-                    break;
-                }
+        while let Some((oldest, _)) = self.blocks.first_key_value() {
+            let oldest = *oldest;
+            if oldest < n {
+                self.blocks.remove(&oldest);
             } else {
                 break;
             }
         }
     }
 
-    async fn backfill_behind(&mut self, n: u64) -> Result<bool> {
+    async fn backfill_behind(&mut self, n: u64, client: Arc<dyn ExecutionSpec<N>>) -> Result<bool> {
         if self.blocks.len() < 2 {
             return Ok(false);
         }
 
         if let Some(block) = self.blocks.get(&n) {
             let prev = n - 1;
-            if self.blocks.get(&prev).is_none() {
-                let backfilled = self.rpc.get_block(block.parent_hash).await?;
-                if backfilled.is_hash_valid() && block.parent_hash == backfilled.hash {
-                    info!("backfilled: block={}", backfilled.number);
-                    self.blocks.insert(backfilled.number.to(), backfilled);
+            if !self.blocks.contains_key(&prev) {
+                let backfilled = client
+                    .get_untrusted_block(block.header().parent_hash().into(), false)
+                    .await?
+                    .ok_or(eyre!("backfill block not found"))?;
+
+                if N::is_hash_valid(&backfilled)
+                    && block.header().parent_hash() == backfilled.header().hash()
+                {
+                    info!("backfilled: block={}", backfilled.header().number());
+                    self.blocks.insert(backfilled.header().number(), backfilled);
                     Ok(true)
                 } else {
                     warn!("bad block backfill");
@@ -328,22 +377,21 @@ impl<N: NetworkSpec, R: ExecutionRpc<N>> Inner<N, R> {
         }
     }
 
-    pub async fn push_finalized_block(&mut self, block: Block<N::TransactionResponse>) {
-        if let Some(old_block) = self.blocks.get(&block.number.to()) {
-            if old_block.hash != block.hash {
+    pub fn push_finalized_block(&mut self, block: N::BlockResponse) {
+        if let Some(old_block) = self.blocks.get(&block.header().number()) {
+            if old_block.header().hash() != block.header().hash() {
                 self.blocks = BTreeMap::new();
             }
         }
 
-        self.finalized_block = Some(block.clone());
-        self.push_block(block).await;
+        self.finalized_block = Some(block);
     }
 
     fn remove_block(&mut self, number: u64) {
         if let Some(block) = self.blocks.remove(&number) {
-            self.hashes.remove(&block.hash);
-            block.transactions.hashes().iter().for_each(|tx| {
-                self.txs.remove(tx);
+            self.hashes.remove(&block.header().hash());
+            block.transactions().hashes().for_each(|tx| {
+                self.txs.remove(&tx);
             });
         }
     }
@@ -356,7 +404,8 @@ struct TransactionLocation {
 
 #[derive(Clone)]
 pub enum FilterType {
-    Logs,
+    // filter content
+    Logs(Box<Filter>),
     // block number when the filter was created or last queried
     NewBlock(u64),
     PendingTransactions,

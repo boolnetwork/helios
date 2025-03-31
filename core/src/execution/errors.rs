@@ -3,7 +3,7 @@ use alloy::sol_types::decode_revert_reason;
 use eyre::Report;
 use thiserror::Error;
 
-use crate::types::BlockTag;
+use helios_common::types::BlockTag;
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
@@ -21,8 +21,8 @@ pub enum ExecutionError {
     NoReceiptsForBlock(BlockTag),
     #[error("missing log for transaction: {0}, index: {1}")]
     MissingLog(B256, U256),
-    #[error("too many logs to prove: {0}, current limit is: {1}")]
-    TooManyLogsToProve(usize, usize),
+    #[error("too many logs to prove: {0} spanning {1} blocks current limit is: {2} blocks")]
+    TooManyLogsToProve(usize, usize, usize),
     #[error("execution rpc is for the incorrect network")]
     IncorrectRpcNetwork(),
     #[error("block not found: {0}")]
@@ -31,6 +31,8 @@ pub enum ExecutionError {
     BlockReceiptsRootMismatch(BlockTag),
     #[error("filter not found: 0x{0:x}")]
     FilterNotFound(U256),
+    #[error("log does not match filter")]
+    LogFilterMismatch(),
 }
 
 /// Errors that can occur during evm.rs calls

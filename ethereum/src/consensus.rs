@@ -2,17 +2,18 @@ use std::marker::PhantomData;
 use std::process;
 use std::sync::Arc;
 
-use alloy::consensus::{Transaction as TxTrait, TxEnvelope};
-use alloy::primitives::{b256, fixed_bytes, B256, U256, U64};
-use alloy::rlp::{encode, Decodable};
-use alloy::rpc::types::Transaction;
+use alloy::consensus::proofs::{calculate_transaction_root, calculate_withdrawals_root};
+use alloy::consensus::{Header as ConsensusHeader, Transaction as TxTrait, TxEnvelope};
+use alloy::eips::eip4895::{Withdrawal, Withdrawals};
+use alloy::primitives::{b256, fixed_bytes, Bloom, BloomInput, B256, U256};
+use alloy::rlp::Decodable;
+use alloy::rpc::types::{Block, BlockTransactions, Header, Transaction};
 use chrono::Duration;
 use eyre::eyre;
 use eyre::Result;
 use futures::future::join_all;
 use tracing::{debug, error, info, warn};
 use tree_hash::TreeHash;
-use triehash_ethereum::ordered_trie_root;
 
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Receiver;
@@ -29,7 +30,6 @@ use helios_consensus_core::{
 };
 use helios_core::consensus::Consensus;
 use helios_core::time::{interval_at, Instant, SystemTime, UNIX_EPOCH};
-use helios_core::types::{Block, Transactions};
 
 use crate::config::checkpoints::CheckpointFallback;
 use crate::config::networks::Network;
@@ -60,7 +60,7 @@ pub struct Inner<S: ConsensusSpec, R: ConsensusRpc<S>> {
     phantom: PhantomData<S>,
 }
 
-impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> Consensus<Transaction>
+impl<S: ConsensusSpec, R: ConsensusRpc<S>, DB: Database> Consensus<Block>
     for ConsensusClient<S, R, DB>
 {
     fn block_recv(&mut self) -> Option<Receiver<Block<Transaction>>> {
@@ -357,17 +357,12 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
 
         self.bootstrap(checkpoint).await?;
 
-        let current_period = calc_sync_period::<S>(self.store.finalized_header.beacon().slot);
-        let updates = self
-            .rpc
-            .get_updates(current_period, MAX_REQUEST_LIGHT_CLIENT_UPDATES)
-            .await?;
+        let updates: Vec<Update<S>> = self.get_updates().await?;
 
         for update in updates {
             self.verify_update(&update)?;
             self.apply_update(&update);
         }
-
         let finality_update = self.rpc.get_finality_update().await?;
         self.verify_finality_update(&finality_update)?;
         self.apply_finality_update(&finality_update);
@@ -379,6 +374,38 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
         );
 
         Ok(())
+    }
+
+    pub async fn get_updates(&self) -> Result<Vec<Update<S>>> {
+        let expected_current_slot = self.expected_current_slot();
+        let expected_current_period = calc_sync_period::<S>(expected_current_slot);
+        let mut next_update_fetch_period =
+            calc_sync_period::<S>(self.store.finalized_header.beacon().slot);
+
+        let mut updates: Vec<Update<S>> = vec![];
+        if expected_current_period - next_update_fetch_period >= 128 {
+            while next_update_fetch_period < expected_current_period {
+                let batch_size = std::cmp::min(
+                    expected_current_period - next_update_fetch_period,
+                    MAX_REQUEST_LIGHT_CLIENT_UPDATES.into(),
+                );
+                let update = self
+                    .rpc
+                    .get_updates(next_update_fetch_period, batch_size.try_into().unwrap())
+                    .await?;
+                updates.extend(update);
+
+                next_update_fetch_period += batch_size;
+            }
+        }
+
+        let update: Vec<Update<S>> = self
+            .rpc
+            .get_updates(next_update_fetch_period, MAX_REQUEST_LIGHT_CLIENT_UPDATES)
+            .await?;
+        updates.extend(update);
+
+        Ok(updates)
     }
 
     pub async fn advance(&mut self) -> Result<()> {
@@ -444,7 +471,7 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
             .await
             .map_err(|err| eyre!("could not fetch bootstrap: {}", err))?;
 
-        let is_valid = self.is_valid_checkpoint(bootstrap.header.beacon().slot);
+        let is_valid = self.is_valid_checkpoint(bootstrap.header().beacon().slot);
 
         if !is_valid {
             if self.config.strict_checkpoint_age {
@@ -505,9 +532,9 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
     }
 
     fn log_finality_update(&self, update: &FinalityUpdate<S>) {
-        let size = S::sync_commitee_size() as f32;
+        let size = S::sync_committee_size() as f32;
         let participation =
-            get_bits::<S>(&update.sync_aggregate.sync_committee_bits) as f32 / size * 100f32;
+            get_bits::<S>(&update.sync_aggregate().sync_committee_bits) as f32 / size * 100f32;
         let decimals = if participation == 100.0 { 1 } else { 2 };
         let age = self.age(self.store.finalized_header.beacon().slot);
 
@@ -524,9 +551,9 @@ impl<S: ConsensusSpec, R: ConsensusRpc<S>> Inner<S, R> {
     }
 
     fn log_optimistic_update(&self, update: &FinalityUpdate<S>) {
-        let size = S::sync_commitee_size() as f32;
+        let size = S::sync_committee_size() as f32;
         let participation =
-            get_bits::<S>(&update.sync_aggregate.sync_committee_bits) as f32 / size * 100f32;
+            get_bits::<S>(&update.sync_aggregate().sync_committee_bits) as f32 / size * 100f32;
         let decimals = if participation == 100.0 { 1 } else { 2 };
         let age = self.age(self.store.optimistic_header.beacon().slot);
 
@@ -596,46 +623,58 @@ fn payload_to_block<S: ConsensusSpec>(value: ExecutionPayload<S>) -> Block<Trans
                 block_hash: Some(*value.block_hash()),
                 block_number: Some(*value.block_number()),
                 transaction_index: Some(i as u64),
-                from: tx_envelope.recover_signer().unwrap().clone(),
+                from: tx_envelope.recover_signer().unwrap(),
                 effective_gas_price: Some(tx_envelope.effective_gas_price(base_fee)),
                 inner: tx_envelope,
             }
         })
-        .collect::<Vec<Transaction>>();
+        .collect::<Vec<_>>();
+    let tx_envelopes = txs.iter().map(|tx| tx.inner.clone()).collect::<Vec<_>>();
+    let txs_root = calculate_transaction_root(&tx_envelopes);
 
-    let raw_txs = value.transactions().iter().map(|tx| tx.inner.to_vec());
-    let txs_root = ordered_trie_root(raw_txs);
+    let withdrawals: Vec<Withdrawal> = value
+        .withdrawals()
+        .unwrap()
+        .into_iter()
+        .map(|w| w.clone().into())
+        .collect();
+    let withdrawals_root = calculate_withdrawals_root(&withdrawals);
 
-    let withdrawals = value.withdrawals().unwrap().iter().map(encode);
-    let withdrawals_root = ordered_trie_root(withdrawals);
+    let logs_bloom: Bloom = Bloom::from(BloomInput::Raw(&value.logs_bloom().clone().inner));
 
-    Block {
-        number: U64::from(*value.block_number()),
-        base_fee_per_gas: *value.base_fee_per_gas(),
-        difficulty: U256::ZERO,
-        extra_data: value.extra_data().inner.to_vec().into(),
-        gas_limit: U64::from(*value.gas_limit()),
-        gas_used: U64::from(*value.gas_used()),
-        hash: *value.block_hash(),
-        logs_bloom: value.logs_bloom().inner.to_vec().into(),
-        miner: *value.fee_recipient(),
+    let consensus_header = ConsensusHeader {
         parent_hash: *value.parent_hash(),
-        receipts_root: *value.receipts_root(),
+        ommers_hash: empty_uncle_hash,
+        beneficiary: *value.fee_recipient(),
         state_root: *value.state_root(),
-        timestamp: U64::from(*value.timestamp()),
-        total_difficulty: U64::ZERO,
-        transactions: Transactions::Full(txs),
+        transactions_root: txs_root,
+        receipts_root: *value.receipts_root(),
+        withdrawals_root: Some(withdrawals_root),
+        difficulty: U256::ZERO,
+        number: *value.block_number(),
+        gas_limit: *value.gas_limit(),
+        gas_used: *value.gas_used(),
+        timestamp: *value.timestamp(),
         mix_hash: *value.prev_randao(),
         nonce: empty_nonce,
-        sha3_uncles: empty_uncle_hash,
-        size: U64::ZERO,
-        transactions_root: B256::from_slice(txs_root.as_bytes()),
-        uncles: vec![],
-        blob_gas_used: value.blob_gas_used().map(|v| U64::from(*v)).ok(),
-        excess_blob_gas: value.excess_blob_gas().map(|v| U64::from(*v)).ok(),
-        withdrawals_root: B256::from_slice(withdrawals_root.as_bytes()),
-        parent_beacon_block_root: Some(*value.parent_hash()),
-    }
+        base_fee_per_gas: Some(value.base_fee_per_gas().to::<u64>()),
+        blob_gas_used: value.blob_gas_used().cloned().ok(),
+        excess_blob_gas: value.excess_blob_gas().cloned().ok(),
+        parent_beacon_block_root: None,
+        extra_data: value.extra_data().inner.to_vec().into(),
+        requests_hash: None,
+        logs_bloom,
+    };
+
+    let header = Header {
+        hash: *value.block_hash(),
+        inner: consensus_header,
+        total_difficulty: Some(U256::ZERO),
+        size: Some(U256::ZERO),
+    };
+
+    Block::new(header, BlockTransactions::Full(txs))
+        .with_withdrawals(Some(Withdrawals::new(withdrawals)))
 }
 
 #[cfg(test)]
@@ -665,7 +704,6 @@ mod tests {
         let base_config = networks::mainnet();
         let config = Config {
             consensus_rpc: String::new(),
-            execution_rpc: String::new(),
             chain: base_config.chain,
             forks: base_config.forks,
             strict_checkpoint_age,
@@ -724,7 +762,7 @@ mod tests {
             .unwrap();
 
         let mut update = updates[0].clone();
-        update.next_sync_committee.pubkeys[0] = PublicKey::default();
+        update.next_sync_committee_mut().pubkeys[0] = PublicKey::default();
 
         let err = client.verify_update(&update).err().unwrap();
         assert_eq!(
@@ -751,7 +789,7 @@ mod tests {
 
         let mut next_update = updates[1].clone();
         // Set a different finalized header to test invalid finality proof
-        next_update.finalized_header = updates[0].finalized_header.clone();
+        *next_update.finalized_header_mut() = updates[0].finalized_header().clone();
 
         let err = client.verify_update(&next_update).err().unwrap();
         assert_eq!(
@@ -773,7 +811,7 @@ mod tests {
             .unwrap();
 
         let mut update = updates[0].clone();
-        update.sync_aggregate.sync_committee_signature = Signature::default();
+        update.sync_aggregate_mut().sync_committee_signature = Signature::default();
 
         let err = client.verify_update(&update).err().unwrap();
         assert_eq!(
@@ -800,13 +838,15 @@ mod tests {
         let period = calc_sync_period::<MainnetConsensusSpec>(
             client.store.finalized_header.beacon().slot.into(),
         );
+        *client.rpc.fetched_updates.lock().unwrap() = false;
         let updates: Vec<Update<MainnetConsensusSpec>> = client
             .rpc
             .get_updates(period, MAX_REQUEST_LIGHT_CLIENT_UPDATES)
             .await
             .unwrap();
+
         // Replace here to test invalid finality proof
-        update.finalized_header = updates[0].finalized_header.clone();
+        *update.finalized_header_mut() = updates[0].finalized_header().clone();
 
         let err = client.verify_finality_update(&update).err().unwrap();
         assert_eq!(
@@ -820,7 +860,7 @@ mod tests {
         let client = get_client(false, true).await;
 
         let mut update = client.rpc.get_finality_update().await.unwrap();
-        update.sync_aggregate.sync_committee_signature = Signature::default();
+        update.sync_aggregate_mut().sync_committee_signature = Signature::default();
 
         let err = client.verify_finality_update(&update).err().unwrap();
         assert_eq!(

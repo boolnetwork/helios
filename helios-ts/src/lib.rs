@@ -1,9 +1,12 @@
+#![allow(unexpected_cfgs)]
+
 use eyre::Result;
 use wasm_bindgen::JsError;
 
 pub mod ethereum;
 pub mod opstack;
 pub mod storage;
+pub mod subscription;
 
 #[allow(unused_macros)]
 macro_rules! log {

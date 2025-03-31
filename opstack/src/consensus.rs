@@ -1,34 +1,36 @@
-use alloy::consensus::Transaction as TxTrait;
-use alloy::primitives::{b256, fixed_bytes, keccak256, Address, B256, U256, U64};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use alloy::consensus::proofs::{calculate_transaction_root, calculate_withdrawals_root};
+use alloy::consensus::{Header as ConsensusHeader, Transaction as TxTrait};
+use alloy::eips::eip4895::{Withdrawal, Withdrawals};
+use alloy::primitives::{b256, fixed_bytes, Address, Bloom, BloomInput, B256, U256};
 use alloy::rlp::Decodable;
-use alloy::rpc::types::EIP1186AccountProofResponse;
-use alloy::rpc::types::Transaction as EthTransaction;
-use alloy_rlp::encode;
+use alloy::rpc::types::{
+    Block, EIP1186AccountProofResponse, Header, Transaction as EthTransaction,
+};
 use eyre::{eyre, OptionExt, Result};
 use op_alloy_consensus::OpTxEnvelope;
+use op_alloy_network::primitives::BlockTransactions;
 use op_alloy_rpc_types::Transaction;
-use std::str::FromStr;
-use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{
     mpsc::{channel, Receiver},
     watch,
 };
-use triehash_ethereum::ordered_trie_root;
+use tracing::{error, info, warn};
 
 use helios_consensus_core::consensus_spec::MainnetConsensusSpec;
 use helios_core::consensus::Consensus;
+use helios_core::execution::proof::{verify_account_proof, verify_mpt_proof};
 use helios_core::time::{interval, SystemTime, UNIX_EPOCH};
-use helios_core::types::{Block, Transactions};
 use helios_ethereum::consensus::ConsensusClient as EthConsensusClient;
-use std::sync::{Arc, Mutex};
 
-use crate::{config::Config, types::ExecutionPayload, SequencerCommitment};
-
-use helios_core::execution::proof::{encode_account, verify_proof};
 use helios_ethereum::database::ConfigDB;
 use helios_ethereum::rpc::http_rpc::HttpRpc;
-use tracing::{error, info, warn};
+
+use crate::{config::Config, types::ExecutionPayload, SequencerCommitment};
 
 // Storage slot containing the unsafe signer address in all superchain system config contracts
 const UNSAFE_SIGNER_SLOT: &str =
@@ -82,7 +84,7 @@ impl ConsensusClient {
     }
 }
 
-impl Consensus<Transaction> for ConsensusClient {
+impl Consensus<Block<Transaction>> for ConsensusClient {
     fn chain_id(&self) -> u64 {
         self.chain_id
     }
@@ -142,7 +144,7 @@ impl Inner {
                 let number = payload.block_number;
 
                 if let Ok(block) = payload_to_block(payload) {
-                    self.latest_block = Some(block.number.to());
+                    self.latest_block = Some(block.header.number);
                     _ = self.block_send.send(block).await;
 
                     tracing::info!(
@@ -193,7 +195,10 @@ fn verify_unsafe_signer(config: Config, signer: Arc<Mutex<Address>>) {
                 .ok_or_eyre("failed to receive block")?;
 
             // Query proof from op consensus server
-            let req = format!("{}unsafe_signer_proof/{}", config.consensus_rpc, block.hash);
+            let req = format!(
+                "{}unsafe_signer_proof/{}",
+                config.consensus_rpc, block.header.hash
+            );
             let proof = reqwest::get(req)
                 .await?
                 .json::<EIP1186AccountProofResponse>()
@@ -201,16 +206,7 @@ fn verify_unsafe_signer(config: Config, signer: Arc<Mutex<Address>>) {
 
             // Verify unsafe signer
             // with account proof
-            let account_path = keccak256(proof.address).to_vec();
-            let account_encoded = encode_account(&proof);
-            let is_valid = verify_proof(
-                &proof.account_proof,
-                block.state_root.as_slice(),
-                &account_path,
-                &account_encoded,
-            );
-
-            if !is_valid {
+            if verify_account_proof(&proof, block.header.state_root).is_err() {
                 warn!(target: "helios::opstack", "account proof invalid");
                 return Err(eyre!("account proof invalid"));
             }
@@ -223,16 +219,14 @@ fn verify_unsafe_signer(config: Config, signer: Arc<Mutex<Address>>) {
                 return Err(eyre!("account proof invalid"));
             }
 
-            let key_hash = keccak256(key);
-            let value = encode(storage_proof.value);
-            let is_valid = verify_proof(
+            if verify_mpt_proof(
+                proof.storage_hash,
+                key,
+                storage_proof.value,
                 &storage_proof.proof,
-                proof.storage_hash.as_slice(),
-                key_hash.as_slice(),
-                &value,
-            );
-
-            if !is_valid {
+            )
+            .is_err()
+            {
                 warn!(target: "helios::opstack", "storage proof invalid");
                 return Err(eyre!("storage proof invalid"));
             }
@@ -334,38 +328,48 @@ fn payload_to_block(value: ExecutionPayload) -> Result<Block<Transaction>> {
             })
         })
         .collect::<Result<Vec<Transaction>>>()?;
+    let tx_envelopes = txs
+        .iter()
+        .map(|tx| tx.inner.inner.clone())
+        .collect::<Vec<_>>();
+    let txs_root = calculate_transaction_root(&tx_envelopes);
 
-    let raw_txs = value.transactions.iter().map(|tx| tx.to_vec());
-    let txs_root = ordered_trie_root(raw_txs);
+    let withdrawals: Vec<Withdrawal> = value.withdrawals.into_iter().map(|w| w.into()).collect();
+    let withdrawals_root = calculate_withdrawals_root(&withdrawals);
 
-    let withdrawals = value.withdrawals.iter().map(|v| encode(v));
-    let withdrawals_root = ordered_trie_root(withdrawals);
+    let logs_bloom: Bloom = Bloom::from(BloomInput::Raw(&value.logs_bloom));
 
-    Ok(Block {
-        number: U64::from(value.block_number),
-        base_fee_per_gas: value.base_fee_per_gas,
-        difficulty: U256::ZERO,
-        extra_data: value.extra_data.to_vec().into(),
-        gas_limit: U64::from(value.gas_limit),
-        gas_used: U64::from(value.gas_used),
-        hash: value.block_hash,
-        logs_bloom: value.logs_bloom.to_vec().into(),
-        miner: value.fee_recipient,
+    let consensus_header = ConsensusHeader {
         parent_hash: value.parent_hash,
-        receipts_root: value.receipts_root,
+        ommers_hash: empty_uncle_hash,
+        beneficiary: Address::from(*value.fee_recipient),
         state_root: value.state_root,
-        timestamp: U64::from(value.timestamp),
-        total_difficulty: U64::ZERO,
-        transactions: Transactions::Full(txs),
+        transactions_root: txs_root,
+        receipts_root: value.receipts_root,
+        withdrawals_root: Some(withdrawals_root),
+        difficulty: U256::ZERO,
+        number: value.block_number,
+        gas_limit: value.gas_limit,
+        gas_used: value.gas_used,
+        timestamp: value.timestamp,
         mix_hash: value.prev_randao,
         nonce: empty_nonce,
-        sha3_uncles: empty_uncle_hash,
-        size: U64::ZERO,
-        transactions_root: B256::from_slice(txs_root.as_bytes()),
-        withdrawals_root: B256::from_slice(withdrawals_root.as_bytes()),
-        uncles: vec![],
-        blob_gas_used: Some(U64::from(value.blob_gas_used)),
-        excess_blob_gas: Some(U64::from(value.excess_blob_gas)),
+        base_fee_per_gas: Some(value.base_fee_per_gas.to::<u64>()),
+        blob_gas_used: Some(value.blob_gas_used),
+        excess_blob_gas: Some(value.excess_blob_gas),
         parent_beacon_block_root: None,
-    })
+        extra_data: value.extra_data.to_vec().into(),
+        requests_hash: None,
+        logs_bloom,
+    };
+
+    let header = Header {
+        hash: value.block_hash,
+        inner: consensus_header,
+        total_difficulty: Some(U256::ZERO),
+        size: Some(U256::ZERO),
+    };
+
+    Ok(Block::new(header, BlockTransactions::Full(txs))
+        .with_withdrawals(Some(Withdrawals::new(withdrawals))))
 }

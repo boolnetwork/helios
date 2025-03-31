@@ -3,35 +3,43 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, Bytes, B256, U256};
-use alloy::rpc::types::{Filter, FilterChanges, Log, SyncStatus};
+use alloy::rpc::types::{
+    AccessListResult, EIP1186AccountProofResponse, Filter, FilterChanges, Log, SyncStatus,
+};
 use eyre::Result;
 use tracing::{info, warn};
+
+use helios_common::{
+    execution_mode::ExecutionMode,
+    fork_schedule::ForkSchedule,
+    network_spec::NetworkSpec,
+    types::{BlockTag, SubEventRx, SubscriptionType},
+};
 
 use crate::client::node::Node;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::client::rpc::Rpc;
 use crate::consensus::Consensus;
-use crate::network_spec::NetworkSpec;
 use crate::time::interval;
-use crate::types::{Block, BlockTag};
 
 pub mod node;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod rpc;
 
-pub struct Client<N: NetworkSpec, C: Consensus<N::TransactionResponse>> {
+pub struct Client<N: NetworkSpec, C: Consensus<N::BlockResponse>> {
     node: Arc<Node<N, C>>,
     #[cfg(not(target_arch = "wasm32"))]
     rpc: Option<Rpc<N, C>>,
 }
 
-impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
+impl<N: NetworkSpec, C: Consensus<N::BlockResponse>> Client<N, C> {
     pub fn new(
-        execution_rpc: &str,
+        execution_mode: ExecutionMode,
         consensus: C,
+        fork_schedule: ForkSchedule,
         #[cfg(not(target_arch = "wasm32"))] rpc_address: Option<SocketAddr>,
     ) -> Result<Self> {
-        let node = Node::new(execution_rpc, consensus)?;
+        let node = Node::new(execution_mode, consensus, fork_schedule)?;
         let node = Arc::new(node);
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +66,10 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
         Ok(())
     }
 
+    pub async fn subscribe(&self, sub_type: SubscriptionType) -> Result<SubEventRx<N>> {
+        self.node.subscribe(sub_type).await
+    }
+
     pub async fn shutdown(&self) {
         info!(target: "helios::client","shutting down");
         if let Err(err) = self.node.consensus.shutdown() {
@@ -69,8 +81,22 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
         self.node.call(tx, block).await.map_err(|err| err.into())
     }
 
-    pub async fn estimate_gas(&self, tx: &N::TransactionRequest) -> Result<u64> {
-        self.node.estimate_gas(tx).await.map_err(|err| err.into())
+    pub async fn estimate_gas(&self, tx: &N::TransactionRequest, block: BlockTag) -> Result<u64> {
+        self.node
+            .estimate_gas(tx, block)
+            .await
+            .map_err(|err| err.into())
+    }
+
+    pub async fn create_access_list(
+        &self,
+        tx: &N::TransactionRequest,
+        block: BlockTag,
+    ) -> Result<AccessListResult> {
+        self.node
+            .create_access_list(tx, block)
+            .await
+            .map_err(|err| err.into())
     }
 
     pub async fn get_balance(&self, address: Address, block: BlockTag) -> Result<U256> {
@@ -99,10 +125,19 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
     pub async fn get_storage_at(
         &self,
         address: Address,
-        slot: B256,
+        slot: U256,
         block: BlockTag,
-    ) -> Result<U256> {
+    ) -> Result<B256> {
         self.node.get_storage_at(address, slot, block).await
+    }
+
+    pub async fn get_proof(
+        &self,
+        address: Address,
+        slots: Option<&[B256]>,
+        block: BlockTag,
+    ) -> Result<EIP1186AccountProofResponse> {
+        self.node.get_proof(address, slots, block).await
     }
 
     pub async fn send_raw_transaction(&self, bytes: &[u8]) -> Result<B256> {
@@ -179,7 +214,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
         &self,
         block: BlockTag,
         full_tx: bool,
-    ) -> Result<Option<Block<N::TransactionResponse>>> {
+    ) -> Result<Option<N::BlockResponse>> {
         self.node.get_block_by_number(block, full_tx).await
     }
 
@@ -187,7 +222,7 @@ impl<N: NetworkSpec, C: Consensus<N::TransactionResponse>> Client<N, C> {
         &self,
         hash: B256,
         full_tx: bool,
-    ) -> Result<Option<Block<N::TransactionResponse>>> {
+    ) -> Result<Option<N::BlockResponse>> {
         self.node.get_block_by_hash(hash, full_tx).await
     }
 

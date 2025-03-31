@@ -1,204 +1,293 @@
-use alloy::consensus::Account;
-use alloy::primitives::{b256, keccak256, Bytes, B256, U256};
-use alloy::rlp::{encode, Decodable};
+use alloy::consensus::BlockHeader;
+use alloy::network::{BlockResponse, ReceiptResponse};
+use alloy::primitives::{keccak256, Bytes, B256, U256};
+use alloy::rlp;
 use alloy::rpc::types::EIP1186AccountProofResponse;
+use alloy_trie::root::ordered_trie_root_with_encoder;
+use alloy_trie::{
+    proof::{verify_proof, ProofRetainer},
+    root::adjust_index_for_rlp,
+    HashBuilder, Nibbles, TrieAccount, KECCAK_EMPTY,
+};
+use eyre::{eyre, Result};
 
-pub fn verify_proof(proof: &[Bytes], root: &[u8], path: &[u8], value: &[u8]) -> bool {
-    let mut expected_hash = root.to_vec();
-    let mut path_offset = 0;
+use helios_common::{network_spec::NetworkSpec, types::BlockTag};
 
-    for (i, node) in proof.iter().enumerate() {
-        if expected_hash != keccak256(node).to_vec() {
-            return false;
-        }
+use super::errors::ExecutionError;
 
-        let mut node = &node[..];
-        let node_list: Vec<Bytes> = Vec::decode(&mut node).unwrap();
-
-        if node_list.len() == 17 {
-            if i == proof.len() - 1 {
-                // exclusion proof
-                let nibble = get_nibble(path, path_offset);
-                let node = &node_list[nibble as usize];
-
-                if node.is_empty() && is_empty_value(value) {
-                    return true;
-                }
-            } else {
-                let nibble = get_nibble(path, path_offset);
-                expected_hash.clone_from(&node_list[nibble as usize].to_vec());
-
-                path_offset += 1;
-            }
-        } else if node_list.len() == 2 {
-            if i == proof.len() - 1 {
-                // exclusion proof
-                if !paths_match(&node_list[0], skip_length(&node_list[0]), path, path_offset)
-                    && is_empty_value(value)
-                {
-                    return true;
-                }
-
-                // inclusion proof
-                if &node_list[1] == value {
-                    return paths_match(
-                        &node_list[0],
-                        skip_length(&node_list[0]),
-                        path,
-                        path_offset,
-                    );
-                }
-            } else {
-                let node_path = &node_list[0];
-                let prefix_length = shared_prefix_length(path, path_offset, node_path);
-                if prefix_length < node_path.len() * 2 - skip_length(node_path) {
-                    // The proof shows a divergent path, but we're not
-                    // at the end of the proof, so something's wrong.
-                    return false;
-                }
-                path_offset += prefix_length;
-                expected_hash.clone_from(&node_list[1].to_vec());
-            }
-        } else {
-            return false;
-        }
-    }
-
-    false
-}
-
-fn paths_match(p1: &[u8], s1: usize, p2: &[u8], s2: usize) -> bool {
-    let len1 = p1.len() * 2 - s1;
-    let len2 = p2.len() * 2 - s2;
-
-    if len1 != len2 {
-        return false;
-    }
-
-    for offset in 0..len1 {
-        let n1 = get_nibble(p1, s1 + offset);
-        let n2 = get_nibble(p2, s2 + offset);
-
-        if n1 != n2 {
-            return false;
-        }
-    }
-
-    true
-}
-
-#[allow(dead_code)]
-fn get_rest_path(p: &[u8], s: usize) -> String {
-    let mut ret = String::new();
-    for i in s..p.len() * 2 {
-        let n = get_nibble(p, i);
-        ret += &format!("{n:01x}");
-    }
-    ret
-}
-
-fn is_empty_value(value: &[u8]) -> bool {
-    let empty_account = Account {
-        nonce: 0,
-        balance: U256::ZERO,
-        storage_root: b256!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"),
-        code_hash: b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"),
-    };
-
-    let new_empty_account = Account {
-        nonce: 0,
-        balance: U256::ZERO,
-        storage_root: B256::ZERO,
-        code_hash: B256::ZERO,
-    };
-
-    let empty_account = encode(empty_account);
-    let new_empty_account = encode(new_empty_account);
-
-    let is_empty_slot = value.len() == 1 && value[0] == 0x80;
-    let is_empty_account = value == empty_account || value == new_empty_account;
-    is_empty_slot || is_empty_account
-}
-
-fn shared_prefix_length(path: &[u8], path_offset: usize, node_path: &[u8]) -> usize {
-    let skip_length = skip_length(node_path);
-
-    let len = std::cmp::min(
-        node_path.len() * 2 - skip_length,
-        path.len() * 2 - path_offset,
-    );
-    let mut prefix_len = 0;
-
-    for i in 0..len {
-        let path_nibble = get_nibble(path, i + path_offset);
-        let node_path_nibble = get_nibble(node_path, i + skip_length);
-
-        if path_nibble == node_path_nibble {
-            prefix_len += 1;
-        } else {
-            break;
-        }
-    }
-
-    prefix_len
-}
-
-fn skip_length(node: &[u8]) -> usize {
-    if node.is_empty() {
-        return 0;
-    }
-
-    let nibble = get_nibble(node, 0);
-    match nibble {
-        0 => 2,
-        1 => 1,
-        2 => 2,
-        3 => 1,
-        _ => 0,
-    }
-}
-
-fn get_nibble(path: &[u8], offset: usize) -> u8 {
-    let byte = path[offset / 2];
-    if offset % 2 == 0 {
-        byte >> 4
-    } else {
-        byte & 0xF
-    }
-}
-
-pub fn encode_account(proof: &EIP1186AccountProofResponse) -> Vec<u8> {
-    let account = Account {
+/// Verify a given `EIP1186AccountProofResponse`'s account proof against given state root.
+pub fn verify_account_proof(proof: &EIP1186AccountProofResponse, state_root: B256) -> Result<()> {
+    let account_key = proof.address;
+    let account = TrieAccount {
         nonce: proof.nonce,
         balance: proof.balance,
         storage_root: proof.storage_hash,
         code_hash: proof.code_hash,
     };
 
-    encode(account)
+    verify_mpt_proof(state_root, account_key, account, &proof.account_proof)
+        .map_err(|_| eyre!(ExecutionError::InvalidAccountProof(proof.address)))
+}
+
+/// Verify a given `EIP1186AccountProofResponse`'s storage proof against the storage root.
+pub fn verify_storage_proof(proof: &EIP1186AccountProofResponse) -> Result<()> {
+    for storage_proof in &proof.storage_proof {
+        let key = storage_proof.key.as_b256();
+        let value = storage_proof.value;
+
+        verify_mpt_proof(proof.storage_hash, key, value, &storage_proof.proof)
+            .map_err(|_| ExecutionError::InvalidStorageProof(proof.address, key))?;
+    }
+
+    Ok(())
+}
+
+/// Verify a given `EIP1186AccountProofResponse`'s code hash against the given code.
+pub fn verify_code_hash_proof(proof: &EIP1186AccountProofResponse, code: &Bytes) -> Result<()> {
+    if (proof.code_hash == KECCAK_EMPTY || proof.code_hash == B256::ZERO) && code.is_empty() {
+        Ok(())
+    } else {
+        let code_hash = keccak256(code);
+        if proof.code_hash != code_hash {
+            return Err(ExecutionError::CodeHashMismatch(
+                proof.address,
+                code_hash,
+                proof.code_hash,
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+/// Verifies a MPT proof for a given key-value pair against the provided root hash.
+/// This function wraps `alloy_trie::proof::verify_proof` and checks
+/// if the value represents an empty account or slot to support exclusion proofs.
+///
+/// # Parameters
+/// - `root`: The root hash of the MPT.
+/// - `raw_key`: The key to be verified, which will be hashed using `keccak256`.
+/// - `raw_value`: The value associated with the key, which will be RLP encoded.
+/// - `proof`: A slice of bytes representing the MPT proof.
+pub fn verify_mpt_proof<K: AsRef<[u8]>, V: rlp::Encodable>(
+    root: B256,
+    raw_key: K,
+    raw_value: V,
+    proof: &[Bytes],
+) -> Result<()> {
+    let key = Nibbles::unpack(keccak256(raw_key));
+    let value = rlp::encode(raw_value);
+
+    let value = if is_empty_value(&value) {
+        None // exclusion proof
+    } else {
+        Some(value) // inclusion proof
+    };
+
+    verify_proof(root, key, value, proof).map_err(|e| eyre!(e))
+}
+
+/// Check if the value is an empty account or empty slot.
+fn is_empty_value(value: &[u8]) -> bool {
+    let empty_account = TrieAccount::default();
+    let new_empty_account = TrieAccount {
+        nonce: 0,
+        balance: U256::ZERO,
+        storage_root: B256::ZERO,
+        code_hash: B256::ZERO,
+    };
+
+    let empty_account = rlp::encode(empty_account);
+    let new_empty_account = rlp::encode(new_empty_account);
+
+    let is_empty_slot = value.len() == 1 && value[0] == 0x80;
+    let is_empty_account = value == empty_account || value == new_empty_account;
+    is_empty_slot || is_empty_account
+}
+
+/// Create a MPT proof for a given receipt in a list of receipts.
+pub fn create_receipt_proof<N: NetworkSpec>(
+    receipts: Vec<N::ReceiptResponse>,
+    target_index: usize,
+) -> Vec<Bytes> {
+    // Initialise the trie builder with proof retainer for the target index
+    let receipts_len = receipts.len();
+    let retainer = ProofRetainer::new(vec![Nibbles::unpack(rlp::encode_fixed_size(&target_index))]);
+    let mut hb = HashBuilder::default().with_proof_retainer(retainer);
+
+    // Iterate over each receipt, adding it to the trie
+    for i in 0..receipts_len {
+        let index = adjust_index_for_rlp(i, receipts_len);
+        let index_buffer = rlp::encode_fixed_size(&index);
+        hb.add_leaf(
+            Nibbles::unpack(&index_buffer),
+            N::encode_receipt(&receipts[index]).as_slice(),
+        );
+    }
+
+    // Note that calling `root()` is mandatory to build the trie
+    hb.root();
+
+    // Extract the proof nodes from the trie
+    hb.take_proof_nodes()
+        .into_nodes_sorted()
+        .into_iter()
+        .map(|n| n.1)
+        .collect::<Vec<_>>()
+}
+
+/// Given a receipt, the root hash, and a proof, verify the proof.
+pub fn verify_receipt_proof<N: NetworkSpec>(
+    receipt: &N::ReceiptResponse,
+    root: B256,
+    proof: &[Bytes],
+) -> Result<()> {
+    let key = {
+        let index = receipt.transaction_index().unwrap() as usize;
+        let index_buffer = rlp::encode_fixed_size(&index);
+        Nibbles::unpack(&index_buffer)
+    };
+    let expected_value = Some(N::encode_receipt(receipt));
+
+    verify_proof(root, key, expected_value, proof).map_err(|e| eyre!(e))
+}
+
+/// Calculate the receipts root hash from given list of receipts
+/// and verify it against the given block's receipts root.
+pub fn verify_block_receipts<N: NetworkSpec>(
+    receipts: &[N::ReceiptResponse],
+    block: &N::BlockResponse,
+) -> Result<()> {
+    let receipts_encoded = receipts.iter().map(N::encode_receipt).collect::<Vec<_>>();
+    let expected_receipt_root = ordered_trie_root_noop_encoder(&receipts_encoded);
+
+    if expected_receipt_root != block.header().receipts_root() {
+        return Err(ExecutionError::BlockReceiptsRootMismatch(BlockTag::Number(
+            block.header().number(),
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Compute a trie root of a collection of encoded items.
+/// Ref: https://github.com/alloy-rs/trie/blob/main/src/root.rs.
+pub fn ordered_trie_root_noop_encoder(items: &[Vec<u8>]) -> B256 {
+    #[allow(clippy::ptr_arg)] // the fn signature is fixed in the external crate
+    fn noop_encoder(item: &Vec<u8>, buffer: &mut Vec<u8>) {
+        buffer.extend_from_slice(item);
+    }
+
+    ordered_trie_root_with_encoder(items, noop_encoder)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::execution::proof::shared_prefix_length;
+    use alloy::primitives::b256;
 
-    #[tokio::test]
-    async fn test_shared_prefix_length() {
-        // We compare the path starting from the 6th nibble i.e. the 6 in 0x6f
-        let path: Vec<u8> = vec![0x12, 0x13, 0x14, 0x6f, 0x6c, 0x64, 0x21];
-        let path_offset = 6;
-        // Our node path matches only the first 5 nibbles of the path
-        let node_path: Vec<u8> = vec![0x6f, 0x6c, 0x63, 0x21];
-        let shared_len = shared_prefix_length(&path, path_offset, &node_path);
-        assert_eq!(shared_len, 5);
+    use helios_ethereum::spec::Ethereum as EthereumSpec;
+    use helios_test_utils::*;
 
-        // Now we compare the path starting from the 5th nibble i.e. the 4 in 0x14
-        let path: Vec<u8> = vec![0x12, 0x13, 0x14, 0x6f, 0x6c, 0x64, 0x21];
-        let path_offset = 5;
-        // Our node path matches only the first 7 nibbles of the path
-        // Note the first nibble is 1, so we skip 1 nibble
-        let node_path: Vec<u8> = vec![0x14, 0x6f, 0x6c, 0x64, 0x11];
-        let shared_len = shared_prefix_length(&path, path_offset, &node_path);
-        assert_eq!(shared_len, 7);
+    use super::*;
+
+    #[test]
+    fn test_verify_account_proof() {
+        let proof = rpc_proof();
+        let state_root = rpc_block().header().state_root();
+
+        let result = verify_account_proof(&proof, state_root);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_storage_proof() {
+        let proof = rpc_proof();
+
+        let result = verify_storage_proof(&proof);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_code_hash_proof() {
+        let proof = rpc_proof();
+        let code = rpc_account().code.unwrap();
+
+        let result = verify_code_hash_proof(&proof, &code);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_code_hash_proof_empty_hash() {
+        let proof = EIP1186AccountProofResponse::default();
+        let code = Bytes::new();
+
+        let result = verify_code_hash_proof(&proof, &code);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_code_hash_proof_empty_keccak() {
+        let mut proof = EIP1186AccountProofResponse::default();
+        proof.code_hash = KECCAK_EMPTY;
+        let code = Bytes::new();
+
+        let result = verify_code_hash_proof(&proof, &code);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_receipt_proof() {
+        let receipts = rpc_block_receipts();
+        let expected = verifiable_api_tx_receipt_response();
+
+        let proof = create_receipt_proof::<EthereumSpec>(
+            receipts,
+            expected.receipt.transaction_index().unwrap() as usize,
+        );
+
+        assert_eq!(proof, expected.receipt_proof);
+    }
+
+    #[test]
+    fn test_verify_receipt_proof() {
+        let receipts = rpc_block_receipts();
+        let receipts_root = rpc_block().header().receipts_root();
+
+        for idx in 0..receipts.len() {
+            let proof = create_receipt_proof::<EthereumSpec>(receipts.clone(), idx);
+
+            let result =
+                verify_receipt_proof::<EthereumSpec>(&receipts[idx], receipts_root, &proof);
+
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_verify_block_receipts() {
+        let receipts = rpc_block_receipts();
+        let block = rpc_block();
+
+        let result = verify_block_receipts::<EthereumSpec>(&receipts, &block);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ordered_trie_root_noop_encoder() {
+        let items = vec![vec![0u8; 32], vec![1u8; 32]];
+
+        let root = ordered_trie_root_noop_encoder(&items);
+
+        assert_eq!(
+            root,
+            b256!("0x5369c64e2b262259b880114e7ac092e69c673e2671352991989f3a89fbc8f0af")
+        );
     }
 }

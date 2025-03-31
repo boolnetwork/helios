@@ -1,19 +1,19 @@
 [package]
 name = "helios-ethereum"
-version = "0.7.0"
+version = "0.8.5"
 edition = "2021"
 
 [dependencies]
 # consensus
+alloy-trie.workspace = true
 tree_hash.workspace = true
 revm.workspace = true
-triehash-ethereum.workspace = true
 
 # config
 figment = { version = "0.10.7", features = ["toml", "env"] }
 serde_yaml = "0.9.14"
 strum = { version = "0.26.2", features = ["derive"] }
-url = "2.5.0"
+url = {version = "2.5.0", features = ["serde"] }
 
 # async/futures
 tokio.workspace = true
@@ -36,6 +36,8 @@ superstruct.workspace = true
 retri.workspace = true
 typenum.workspace = true
 
+# self crates
+helios-common = { path = "../common" }
 helios-core = { path = "../core" }
 helios-consensus-core = { path = "consensus-core" }
 
