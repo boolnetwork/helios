@@ -104,7 +104,7 @@ impl From<Network> for NetworkConfig {
                     chain_id: 11155420,
                     unsafe_signer: address!("57CACBB0d30b01eb2462e5dC940c161aff3230D3"),
                     system_config_contract: address!("034edd2a225f7f429a63e0f1d2084b9e0a93b538"),
-                    eth_network: EthNetwork::SEPOLIA,
+                    eth_network: EthNetwork::Sepolia,
                 },
                 verify_unsafe_signer: false,
             },

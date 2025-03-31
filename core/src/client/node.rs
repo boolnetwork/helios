@@ -42,7 +42,13 @@ impl<N: NetworkSpec, C: Consensus<N::BlockResponse>> Node<N, C> {
         let block_recv = consensus.block_recv().unwrap();
         let finalized_block_recv = consensus.finalized_block_recv().unwrap();
 
-        let state = State::new(block_recv, finalized_block_recv, 25600, execution_rpc);
+        let state = State::new(MAX_STATE_HISTORY_LENGTH);
+        let client_inner =
+            ExecutionInnerClient::<N, HttpRpc<N>, HttpVerifiableApi>::make_inner_client(
+                execution_mode,
+                state.clone(),
+            )
+            .map_err(ClientError::InternalError)?;
         let execution = Arc::new(
             ExecutionClient::new(client_inner, state.clone(), fork_schedule)
                 .map_err(ClientError::InternalError)?,
